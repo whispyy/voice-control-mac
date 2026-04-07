@@ -1,0 +1,21 @@
+{
+  "name": "voice-control-mac",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "voice": "node src/index.js --voice",
+    "cli": "node src/index.js --cli"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.4.0",
+    "node-record-lpcm16": "^1.0.1",
+    "playwright": "^1.59.1",
+    "sentencepiece-js": "^1.1.0",
+    "sherpa-onnx": "^1.12.35"
+  }
+}
