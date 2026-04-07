@@ -5,7 +5,9 @@
   "scripts": {
     "start": "node src/index.js",
     "voice": "node src/index.js --voice",
-    "cli": "node src/index.js --cli"
+    "cli": "node src/index.js --cli",
+    "download-models": "bash scripts/download-models.sh",
+    "postinstall": "bash scripts/download-models.sh"
   },
   "keywords": [],
   "author": "",
