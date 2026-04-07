@@ -161,6 +161,7 @@ class Listener {
           if (this.state === 'listening_command') {
             console.log('Command timeout. Going back to wake word listening.');
             playErrorSound();
+            this._resetKwsStream();
             this.state = 'listening_wake';
           }
         }, 8000);
@@ -222,9 +223,17 @@ class Listener {
       playErrorSound();
     }
 
-    // Back to wake word listening
+    // Create a fresh KWS stream to avoid stale state
+    this._resetKwsStream();
     this.state = 'listening_wake';
     console.log(`Listening for wake word: "${this.triggerWord}"`);
+  }
+
+  _resetKwsStream() {
+    if (this.kwsStream) {
+      this.kwsStream.free();
+    }
+    this.kwsStream = this.kws.createStream();
   }
 
   stop() {
