@@ -92,8 +92,8 @@ class Listener {
     this.triggerWord = triggerWord;
     this.browser = browser;
     this.recording = null;
-    this.state = 'idle'; // idle | listening_wake | listening_command
-    this.commandAudio = []; // collect audio chunks during command listening
+    // States: listening_wake | listening_command | processing
+    this.state = 'idle';
     this.commandTimeout = null;
   }
 
@@ -107,11 +107,18 @@ class Listener {
     this.vad = createVadDetector();
 
     console.log('Models loaded.');
-    console.log(`Listening for wake word: "${this.triggerWord}"`);
-    console.log('Say the wake word to activate, then speak your command.\n');
-
-    this.state = 'listening_wake';
+    this._switchToWakeMode();
     this._startMic();
+  }
+
+  _switchToWakeMode() {
+    // Always create a fresh KWS stream
+    if (this.kwsStream) {
+      this.kwsStream.free();
+    }
+    this.kwsStream = this.kws.createStream();
+    this.state = 'listening_wake';
+    console.log(`Listening for wake word: "${this.triggerWord}"`);
   }
 
   _startMic() {
@@ -133,6 +140,7 @@ class Listener {
       } else if (this.state === 'listening_command') {
         this._processCommand(samples);
       }
+      // If state is 'processing', audio is silently dropped
     });
 
     this.recording.stream().on('error', (err) => {
@@ -149,20 +157,17 @@ class Listener {
       if (result.keyword && result.keyword !== '') {
         console.log(`\nWake word detected! Listening for command...`);
         playActivationSound();
-        this.kws.reset(this.kwsStream);
 
         // Switch to command mode
         this.state = 'listening_command';
-        this.commandAudio = [];
         this.vad.reset();
 
-        // Safety timeout: stop listening after 8 seconds of no speech end
+        // Safety timeout
         this.commandTimeout = setTimeout(() => {
           if (this.state === 'listening_command') {
             console.log('Command timeout. Going back to wake word listening.');
             playErrorSound();
-            this._resetKwsStream();
-            this.state = 'listening_wake';
+            this._switchToWakeMode();
           }
         }, 8000);
 
@@ -173,67 +178,62 @@ class Listener {
 
   _processCommand(samples) {
     // Feed into VAD in 512-sample windows
-    for (let i = 0; i < samples.length; i += 512) {
-      const end = Math.min(i + 512, samples.length);
-      const chunk = samples.subarray(i, end);
-      if (chunk.length === 512) {
-        this.vad.acceptWaveform(chunk);
-      }
+    for (let i = 0; i + 512 <= samples.length; i += 512) {
+      const chunk = samples.subarray(i, i + 512);
+      this.vad.acceptWaveform(chunk);
     }
 
     // Check if VAD has a complete speech segment
-    while (!this.vad.isEmpty()) {
+    if (!this.vad.isEmpty()) {
       const segment = this.vad.front();
       this.vad.pop();
 
-      // Transcribe the speech segment
+      // Block further audio processing during transcription
+      this.state = 'processing';
       clearTimeout(this.commandTimeout);
       this._transcribe(segment.samples);
-      return;
     }
   }
 
   async _transcribe(samples) {
-    const stream = this.recognizer.createStream();
-    stream.acceptWaveform(SAMPLE_RATE, samples);
-    this.recognizer.decode(stream);
-    const result = this.recognizer.getResult(stream);
-    stream.free();
+    try {
+      const stream = this.recognizer.createStream();
+      stream.acceptWaveform(SAMPLE_RATE, samples);
+      this.recognizer.decode(stream);
+      const result = this.recognizer.getResult(stream);
+      stream.free();
 
-    const text = (result.text || '').trim().toLowerCase();
+      const text = (result.text || '').trim().toLowerCase()
+        // Remove trailing punctuation that STT may add
+        .replace(/[.,!?]+$/g, '');
 
-    if (text) {
-      console.log(`Heard: "${text}"`);
-      playDeactivationSound();
+      if (text) {
+        console.log(`Heard: "${text}"`);
+        playDeactivationSound();
 
-      const parsed = parse(text);
-      if (parsed) {
-        try {
-          await parsed.command.execute(parsed.params, this.browser);
-        } catch (err) {
-          console.log(`Error executing command: ${err.message}`);
+        const parsed = parse(text);
+        if (parsed) {
+          try {
+            await parsed.command.execute(parsed.params, this.browser);
+          } catch (err) {
+            console.log(`Error executing command: ${err.message}`);
+            playErrorSound();
+          }
+        } else {
+          console.log(`Unknown command: "${text}"`);
           playErrorSound();
         }
       } else {
-        console.log(`Unknown command: "${text}"`);
+        console.log('Could not understand. Try again.');
         playErrorSound();
       }
-    } else {
-      console.log('Could not understand. Try again.');
+    } catch (err) {
+      console.log(`Transcription error: ${err.message}`);
       playErrorSound();
     }
 
-    // Create a fresh KWS stream to avoid stale state
-    this._resetKwsStream();
-    this.state = 'listening_wake';
-    console.log(`Listening for wake word: "${this.triggerWord}"`);
-  }
-
-  _resetKwsStream() {
-    if (this.kwsStream) {
-      this.kwsStream.free();
-    }
-    this.kwsStream = this.kws.createStream();
+    // Back to wake word listening with fresh stream
+    this._switchToWakeMode();
   }
 
   stop() {

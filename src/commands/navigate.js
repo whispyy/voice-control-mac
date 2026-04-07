@@ -28,7 +28,8 @@ function match(input) {
 }
 
 async function execute(params, browser) {
-  const { site } = params;
+  // Strip any trailing punctuation STT might add
+  const site = params.site.replace(/[.,!?]+$/g, '');
   const url = SITES[site] || `https://www.${site}.com`;
   await browser.navigate(url);
 }
