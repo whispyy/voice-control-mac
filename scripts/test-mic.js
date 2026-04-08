@@ -2,9 +2,9 @@
 const record = require('node-record-lpcm16');
 const path = require('path');
 const sherpa_onnx = require('sherpa-onnx');
+const stt = require('../src/stt');
 
 const MODELS_DIR = path.join(__dirname, '..', 'models');
-const MOONSHINE_DIR = path.join(MODELS_DIR, 'sherpa-onnx-moonshine-base-en-int8');
 const SAMPLE_RATE = 16000;
 
 function pcmBufferToFloat32(buffer) {
@@ -17,7 +17,16 @@ function pcmBufferToFloat32(buffer) {
 
 console.log('=== Mic + VAD + STT Test ===\n');
 
-console.log('1. Loading VAD model...');
+console.log('1. Loading STT (whisper-cpp)...');
+try {
+  stt.init();
+  console.log('   STT OK\n');
+} catch (err) {
+  console.error('   STT FAILED:', err.message);
+  process.exit(1);
+}
+
+console.log('2. Loading VAD...');
 const vad = sherpa_onnx.createVad({
   sileroVad: {
     model: path.join(MODELS_DIR, 'silero_vad.onnx'),
@@ -33,23 +42,7 @@ const vad = sherpa_onnx.createVad({
   debug: 0,
   bufferSizeInSeconds: 30,
 });
-console.log('   VAD OK');
-
-console.log('2. Loading STT model...');
-const recognizer = sherpa_onnx.createOfflineRecognizer({
-  modelConfig: {
-    moonshine: {
-      preprocessor: path.join(MOONSHINE_DIR, 'preprocess.onnx'),
-      encoder: path.join(MOONSHINE_DIR, 'encode.int8.onnx'),
-      uncachedDecoder: path.join(MOONSHINE_DIR, 'uncached_decode.int8.onnx'),
-      cachedDecoder: path.join(MOONSHINE_DIR, 'cached_decode.int8.onnx'),
-    },
-    tokens: path.join(MOONSHINE_DIR, 'tokens.txt'),
-    numThreads: 1,
-    debug: 0,
-  },
-});
-console.log('   STT OK');
+console.log('   VAD OK\n');
 
 console.log('3. Starting mic...');
 let dataChunks = 0;
@@ -63,22 +56,21 @@ const recording = record.record({
   endian: 'little',
   bitDepth: 16,
   recorder: 'rec',
+  silence: 0,
 });
 
-console.log('   Mic started. Speak now! (will stop after 10 seconds)\n');
+console.log('   Mic started. Speak now! (will stop after 15 seconds)\n');
 
 recording.stream().on('data', (buffer) => {
   dataChunks++;
   const samples = pcmBufferToFloat32(buffer);
   totalSamples += samples.length;
 
-  // Log first few chunks to verify data is flowing
   if (dataChunks <= 3) {
-    const maxVal = Math.max(...Array.from(samples).map(Math.abs));
+    const maxVal = Math.max(...Array.from(samples.slice(0, 100)).map(Math.abs));
     console.log(`   Chunk #${dataChunks}: ${samples.length} samples, max amplitude: ${maxVal.toFixed(4)}`);
   }
 
-  // Feed VAD
   for (let i = 0; i + 512 <= samples.length; i += 512) {
     vad.acceptWaveform(samples.subarray(i, i + 512));
   }
@@ -87,14 +79,10 @@ recording.stream().on('data', (buffer) => {
     const segment = vad.front();
     vad.pop();
     console.log(`\n   VAD detected speech! (${segment.samples.length} samples = ${(segment.samples.length / SAMPLE_RATE).toFixed(1)}s)`);
+    console.log('   Transcribing with whisper-cpp...');
 
-    // Transcribe
-    const stream = recognizer.createStream();
-    stream.acceptWaveform(SAMPLE_RATE, segment.samples);
-    recognizer.decode(stream);
-    const result = recognizer.getResult(stream);
-    stream.free();
-    console.log(`   STT result: "${(result.text || '').trim()}"\n`);
+    const text = stt.transcribe(segment.samples);
+    console.log(`   Result: "${text}"\n`);
   }
 });
 
@@ -102,16 +90,14 @@ recording.stream().on('error', (err) => {
   console.error('   Mic error:', err.message);
 });
 
-// Stop after 10 seconds
 setTimeout(() => {
   recording.stop();
   console.log(`\n=== Summary ===`);
   console.log(`Data chunks received: ${dataChunks}`);
   console.log(`Total samples: ${totalSamples} (${(totalSamples / SAMPLE_RATE).toFixed(1)}s of audio)`);
   if (dataChunks === 0) {
-    console.log('\nPROBLEM: No audio data received! Check that sox/rec is installed and mic permissions are granted.');
+    console.log('\nPROBLEM: No audio data received!');
   }
   vad.free();
-  recognizer.free();
   process.exit(0);
-}, 10000);
+}, 15000);

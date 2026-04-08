@@ -4,9 +4,11 @@ set -e
 MODELS_DIR="$(cd "$(dirname "$0")/.." && pwd)/models"
 mkdir -p "$MODELS_DIR"
 
+WHISPER_MODEL="${WHISPER_MODEL:-base.en}"
+
 echo "Downloading models to $MODELS_DIR..."
 
-# VAD model
+# VAD model (Silero, used by sherpa-onnx)
 if [ ! -f "$MODELS_DIR/silero_vad.onnx" ]; then
   echo "Downloading Silero VAD model..."
   curl -sSL -o "$MODELS_DIR/silero_vad.onnx" \
@@ -16,17 +18,15 @@ else
   echo "VAD model already exists, skipping."
 fi
 
-# Moonshine Base STT model
-MOONSHINE_DIR="$MODELS_DIR/sherpa-onnx-moonshine-base-en-int8"
-if [ ! -d "$MOONSHINE_DIR" ]; then
-  echo "Downloading Moonshine Base STT model..."
-  curl -sSL -o "$MODELS_DIR/moonshine.tar.bz2" \
-    https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-moonshine-base-en-int8.tar.bz2
-  tar xjf "$MODELS_DIR/moonshine.tar.bz2" -C "$MODELS_DIR"
-  rm "$MODELS_DIR/moonshine.tar.bz2"
-  echo "Moonshine Base model downloaded."
+# Whisper model (used by whisper-cpp for STT)
+WHISPER_FILE="$MODELS_DIR/ggml-${WHISPER_MODEL}.bin"
+if [ ! -f "$WHISPER_FILE" ]; then
+  echo "Downloading Whisper ${WHISPER_MODEL} model..."
+  curl -sSL -o "$WHISPER_FILE" \
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${WHISPER_MODEL}.bin"
+  echo "Whisper model downloaded."
 else
-  echo "Moonshine Base model already exists, skipping."
+  echo "Whisper model already exists, skipping."
 fi
 
 echo "All models ready!"

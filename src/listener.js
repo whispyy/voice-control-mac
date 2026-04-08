@@ -1,11 +1,11 @@
 const record = require('node-record-lpcm16');
 const path = require('path');
 const sherpa_onnx = require('sherpa-onnx');
+const stt = require('./stt');
 const { playActivationSound, playDeactivationSound, playErrorSound } = require('./sounds');
 const { parse } = require('./commands');
 
 const MODELS_DIR = path.join(__dirname, '..', 'models');
-const MOONSHINE_DIR = path.join(MODELS_DIR, 'sherpa-onnx-moonshine-base-en-int8');
 
 const SAMPLE_RATE = 16000;
 const DEBUG = process.env.DEBUG === '1';
@@ -37,7 +37,6 @@ function findTriggerWord(text, triggerWord) {
   const words = text.split(/\s+/);
   const triggerWords = triggerWord.split(/\s+/);
   const triggerLen = triggerWords.length;
-  // Max edit distance: ~30% of trigger word length, minimum 2
   const maxDist = Math.max(2, Math.floor(triggerWord.length * 0.35));
 
   for (let i = 0; i <= words.length - triggerLen; i++) {
@@ -45,27 +44,10 @@ function findTriggerWord(text, triggerWord) {
     const dist = levenshtein(candidate, triggerWord);
     if (dist <= maxDist) {
       debug(`Trigger match: "${candidate}" ~ "${triggerWord}" (dist=${dist}/${maxDist})`);
-      // Return everything after the matched trigger words
       return words.slice(i + triggerLen).join(' ');
     }
   }
   return null;
-}
-
-function createSttRecognizer() {
-  return sherpa_onnx.createOfflineRecognizer({
-    modelConfig: {
-      moonshine: {
-        preprocessor: path.join(MOONSHINE_DIR, 'preprocess.onnx'),
-        encoder: path.join(MOONSHINE_DIR, 'encode.int8.onnx'),
-        uncachedDecoder: path.join(MOONSHINE_DIR, 'uncached_decode.int8.onnx'),
-        cachedDecoder: path.join(MOONSHINE_DIR, 'cached_decode.int8.onnx'),
-      },
-      tokens: path.join(MOONSHINE_DIR, 'tokens.txt'),
-      numThreads: 1,
-      debug: 0,
-    },
-  });
 }
 
 function createVadDetector() {
@@ -101,19 +83,18 @@ class Listener {
     this.browser = browser;
     this.recording = null;
     this.processing = false;
-    // Two-phase: 'wake' = waiting for trigger word, 'command' = waiting for command
     this.phase = 'wake';
     this.commandTimeout = null;
     this.dataReceived = false;
   }
 
   async start() {
-    console.log('Initializing voice models...');
+    console.log('Initializing...');
 
-    this.recognizer = createSttRecognizer();
+    stt.init();
     this.vad = createVadDetector();
 
-    console.log('Models loaded.');
+    console.log('Ready.');
     console.log(`Trigger word: "${this.triggerWord}"`);
     console.log('Say the trigger word, then speak your command after the sound.');
     console.log('Listening...\n');
@@ -137,24 +118,22 @@ class Listener {
     this.recording.stream().on('data', (buffer) => {
       if (!this.dataReceived) {
         this.dataReceived = true;
-        debug('Mic data flowing. Buffer size:', buffer.length, 'bytes');
+        debug('Mic data flowing.');
       }
 
       if (this.processing) return;
 
       const samples = pcmBufferToFloat32(buffer);
 
-      // Feed into VAD in 512-sample windows
       for (let i = 0; i + 512 <= samples.length; i += 512) {
         this.vad.acceptWaveform(samples.subarray(i, i + 512));
       }
 
-      // Check if VAD has a complete speech segment
       if (!this.vad.isEmpty()) {
         const segment = this.vad.front();
         this.vad.pop();
 
-        debug('Speech segment:', (segment.samples.length / SAMPLE_RATE).toFixed(1) + 's', 'phase:', this.phase);
+        debug('Speech:', (segment.samples.length / SAMPLE_RATE).toFixed(1) + 's', 'phase:', this.phase);
 
         this.processing = true;
         this._handleSpeech(segment.samples);
@@ -165,7 +144,6 @@ class Listener {
       console.error('Microphone error:', err.message);
     });
 
-    // Check if mic is producing data
     setTimeout(() => {
       if (!this.dataReceived) {
         console.error('\nNo audio data received!');
@@ -174,18 +152,9 @@ class Listener {
     }, 3000);
   }
 
-  _transcribe(samples) {
-    const stream = this.recognizer.createStream();
-    stream.acceptWaveform(SAMPLE_RATE, samples);
-    this.recognizer.decode(stream);
-    const result = this.recognizer.getResult(stream);
-    stream.free();
-    return (result.text || '').trim().toLowerCase().replace(/[.,!?]+$/g, '');
-  }
-
   async _handleSpeech(samples) {
     try {
-      const text = this._transcribe(samples);
+      const text = stt.transcribe(samples).toLowerCase().replace(/[.,!?]+$/g, '');
       debug('Transcribed:', JSON.stringify(text), 'phase:', this.phase);
 
       if (!text) {
@@ -194,15 +163,12 @@ class Listener {
       }
 
       if (this.phase === 'wake') {
-        // Fuzzy-match trigger word anywhere in the text
         const afterTrigger = findTriggerWord(text, this.triggerWord);
 
         if (afterTrigger !== null) {
           if (afterTrigger) {
-            // Command was included with trigger word (e.g. "test open youtube")
             console.log('Trigger word detected!');
             playActivationSound();
-            debug('Command in same utterance:', afterTrigger);
             await this._executeCommand(afterTrigger);
             this.phase = 'wake';
             this.vad.reset();
@@ -210,13 +176,11 @@ class Listener {
             return;
           }
 
-          // Just the trigger word, wait for command
           console.log('Trigger word detected! Say your command...');
           playActivationSound();
           this.phase = 'command';
           this.vad.reset();
 
-          // Timeout after 6 seconds
           this.commandTimeout = setTimeout(() => {
             if (this.phase === 'command') {
               console.log('No command heard. Say the trigger word again.');
@@ -265,7 +229,6 @@ class Listener {
     if (this.recording) {
       this.recording.stop();
     }
-    if (this.recognizer) this.recognizer.free();
     if (this.vad) this.vad.free();
     clearTimeout(this.commandTimeout);
   }
