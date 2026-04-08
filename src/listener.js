@@ -1,48 +1,13 @@
 const record = require('node-record-lpcm16');
 const path = require('path');
 const sherpa_onnx = require('sherpa-onnx');
-const { SentencePieceProcessor } = require('sentencepiece-js');
 const { playActivationSound, playDeactivationSound, playErrorSound } = require('./sounds');
 const { parse } = require('./commands');
 
 const MODELS_DIR = path.join(__dirname, '..', 'models');
-const KWS_DIR = path.join(MODELS_DIR, 'sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01');
-const MOONSHINE_DIR = path.join(MODELS_DIR, 'sherpa-onnx-moonshine-tiny-en-int8');
+const MOONSHINE_DIR = path.join(MODELS_DIR, 'sherpa-onnx-moonshine-base-en-int8');
 
 const SAMPLE_RATE = 16000;
-
-async function tokenizeKeyword(triggerWord) {
-  const sp = new SentencePieceProcessor();
-  await sp.load(path.join(KWS_DIR, 'bpe.model'));
-  const upper = triggerWord.toUpperCase();
-  const pieces = sp.encodePieces(upper);
-  return pieces.join(' ');
-}
-
-async function createKws(triggerWord) {
-  const keywords = await tokenizeKeyword(triggerWord);
-  console.log(`Wake word tokenized: ${keywords}`);
-
-  return sherpa_onnx.createKws({
-    featConfig: { samplingRate: SAMPLE_RATE, featureDim: 80 },
-    modelConfig: {
-      transducer: {
-        encoder: path.join(KWS_DIR, 'encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx'),
-        decoder: path.join(KWS_DIR, 'decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx'),
-        joiner: path.join(KWS_DIR, 'joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx'),
-      },
-      tokens: path.join(KWS_DIR, 'tokens.txt'),
-      provider: 'cpu',
-      numThreads: 1,
-      debug: 0,
-    },
-    maxActivePaths: 4,
-    numTrailingBlanks: 1,
-    keywordsScore: 1.0,
-    keywordsThreshold: 0.25,
-    keywords: keywords,
-  });
-}
 
 function createSttRecognizer() {
   return sherpa_onnx.createOfflineRecognizer({
@@ -65,9 +30,9 @@ function createVadDetector() {
     sileroVad: {
       model: path.join(MODELS_DIR, 'silero_vad.onnx'),
       threshold: 0.5,
-      minSilenceDuration: 0.8,
+      minSilenceDuration: 0.5,
       minSpeechDuration: 0.25,
-      maxSpeechDuration: 10,
+      maxSpeechDuration: 5,
       windowSize: 512,
     },
     sampleRate: SAMPLE_RATE,
@@ -89,36 +54,24 @@ function pcmBufferToFloat32(buffer) {
 
 class Listener {
   constructor(triggerWord, browser) {
-    this.triggerWord = triggerWord;
+    this.triggerWord = triggerWord.toLowerCase();
     this.browser = browser;
     this.recording = null;
-    // States: listening_wake | listening_command | processing
-    this.state = 'idle';
-    this.commandTimeout = null;
+    this.processing = false;
   }
 
   async start() {
     console.log('Initializing voice models...');
 
-    this.kws = await createKws(this.triggerWord);
-    this.kwsStream = this.kws.createStream();
-
     this.recognizer = createSttRecognizer();
     this.vad = createVadDetector();
 
     console.log('Models loaded.');
-    this._switchToWakeMode();
-    this._startMic();
-  }
+    console.log(`Trigger word: "${this.triggerWord}"`);
+    console.log('Say the trigger word followed by your command (e.g. "' + this.triggerWord + ' open youtube")');
+    console.log('Listening...\n');
 
-  _switchToWakeMode() {
-    // Always create a fresh KWS stream
-    if (this.kwsStream) {
-      this.kwsStream.free();
-    }
-    this.kwsStream = this.kws.createStream();
-    this.state = 'listening_wake';
-    console.log(`Listening for wake word: "${this.triggerWord}"`);
+    this._startMic();
   }
 
   _startMic() {
@@ -133,14 +86,23 @@ class Listener {
     });
 
     this.recording.stream().on('data', (buffer) => {
+      if (this.processing) return;
+
       const samples = pcmBufferToFloat32(buffer);
 
-      if (this.state === 'listening_wake') {
-        this._processWakeWord(samples);
-      } else if (this.state === 'listening_command') {
-        this._processCommand(samples);
+      // Feed into VAD in 512-sample windows
+      for (let i = 0; i + 512 <= samples.length; i += 512) {
+        this.vad.acceptWaveform(samples.subarray(i, i + 512));
       }
-      // If state is 'processing', audio is silently dropped
+
+      // Check if VAD has a complete speech segment
+      if (!this.vad.isEmpty()) {
+        const segment = this.vad.front();
+        this.vad.pop();
+
+        this.processing = true;
+        this._handleSpeech(segment.samples);
+      }
     });
 
     this.recording.stream().on('error', (err) => {
@@ -148,55 +110,9 @@ class Listener {
     });
   }
 
-  _processWakeWord(samples) {
-    this.kwsStream.acceptWaveform(SAMPLE_RATE, samples);
-
-    while (this.kws.isReady(this.kwsStream)) {
-      this.kws.decode(this.kwsStream);
-      const result = this.kws.getResult(this.kwsStream);
-      if (result.keyword && result.keyword !== '') {
-        console.log(`\nWake word detected! Listening for command...`);
-        playActivationSound();
-
-        // Switch to command mode
-        this.state = 'listening_command';
-        this.vad.reset();
-
-        // Safety timeout
-        this.commandTimeout = setTimeout(() => {
-          if (this.state === 'listening_command') {
-            console.log('Command timeout. Going back to wake word listening.');
-            playErrorSound();
-            this._switchToWakeMode();
-          }
-        }, 8000);
-
-        return;
-      }
-    }
-  }
-
-  _processCommand(samples) {
-    // Feed into VAD in 512-sample windows
-    for (let i = 0; i + 512 <= samples.length; i += 512) {
-      const chunk = samples.subarray(i, i + 512);
-      this.vad.acceptWaveform(chunk);
-    }
-
-    // Check if VAD has a complete speech segment
-    if (!this.vad.isEmpty()) {
-      const segment = this.vad.front();
-      this.vad.pop();
-
-      // Block further audio processing during transcription
-      this.state = 'processing';
-      clearTimeout(this.commandTimeout);
-      this._transcribe(segment.samples);
-    }
-  }
-
-  async _transcribe(samples) {
+  async _handleSpeech(samples) {
     try {
+      // Transcribe
       const stream = this.recognizer.createStream();
       stream.acceptWaveform(SAMPLE_RATE, samples);
       this.recognizer.decode(stream);
@@ -204,47 +120,61 @@ class Listener {
       stream.free();
 
       const text = (result.text || '').trim().toLowerCase()
-        // Remove trailing punctuation that STT may add
         .replace(/[.,!?]+$/g, '');
 
-      if (text) {
-        console.log(`Heard: "${text}"`);
-        playDeactivationSound();
+      if (!text) {
+        this.processing = false;
+        return;
+      }
 
-        const parsed = parse(text);
-        if (parsed) {
-          try {
-            await parsed.command.execute(parsed.params, this.browser);
-          } catch (err) {
-            console.log(`Error executing command: ${err.message}`);
-            playErrorSound();
-          }
-        } else {
-          console.log(`Unknown command: "${text}"`);
+      // Check if text starts with trigger word
+      if (!text.startsWith(this.triggerWord)) {
+        // Not a command, ignore
+        this.processing = false;
+        return;
+      }
+
+      // Extract the command part after the trigger word
+      const command = text.slice(this.triggerWord.length).trim();
+
+      if (!command) {
+        // Just the trigger word with no command
+        console.log('Trigger word detected but no command heard.');
+        playActivationSound();
+        this.processing = false;
+        return;
+      }
+
+      console.log(`Heard: "${command}"`);
+      playActivationSound();
+
+      const parsed = parse(command);
+      if (parsed) {
+        try {
+          await parsed.command.execute(parsed.params, this.browser);
+          playDeactivationSound();
+        } catch (err) {
+          console.log(`Error executing command: ${err.message}`);
           playErrorSound();
         }
       } else {
-        console.log('Could not understand. Try again.');
+        console.log(`Unknown command: "${command}"`);
         playErrorSound();
       }
     } catch (err) {
-      console.log(`Transcription error: ${err.message}`);
+      console.log(`Error: ${err.message}`);
       playErrorSound();
     }
 
-    // Back to wake word listening with fresh stream
-    this._switchToWakeMode();
+    this.processing = false;
   }
 
   stop() {
     if (this.recording) {
       this.recording.stop();
     }
-    if (this.kwsStream) this.kwsStream.free();
-    if (this.kws) this.kws.free();
     if (this.recognizer) this.recognizer.free();
     if (this.vad) this.vad.free();
-    clearTimeout(this.commandTimeout);
   }
 }
 
