@@ -8,6 +8,49 @@ const MODELS_DIR = path.join(__dirname, '..', 'models');
 const MOONSHINE_DIR = path.join(MODELS_DIR, 'sherpa-onnx-moonshine-base-en-int8');
 
 const SAMPLE_RATE = 16000;
+const DEBUG = process.env.DEBUG === '1';
+
+function debug(...args) {
+  if (DEBUG) console.log('[debug]', ...args);
+}
+
+// Simple Levenshtein distance for fuzzy matching
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + (a[i - 1] !== b[j - 1] ? 1 : 0),
+      );
+    }
+  }
+  return dp[m][n];
+}
+
+// Check if any word or word-pair in the text fuzzy-matches the trigger word
+function findTriggerWord(text, triggerWord) {
+  const words = text.split(/\s+/);
+  const triggerWords = triggerWord.split(/\s+/);
+  const triggerLen = triggerWords.length;
+  // Max edit distance: ~30% of trigger word length, minimum 2
+  const maxDist = Math.max(2, Math.floor(triggerWord.length * 0.35));
+
+  for (let i = 0; i <= words.length - triggerLen; i++) {
+    const candidate = words.slice(i, i + triggerLen).join(' ');
+    const dist = levenshtein(candidate, triggerWord);
+    if (dist <= maxDist) {
+      debug(`Trigger match: "${candidate}" ~ "${triggerWord}" (dist=${dist}/${maxDist})`);
+      // Return everything after the matched trigger words
+      return words.slice(i + triggerLen).join(' ');
+    }
+  }
+  return null;
+}
 
 function createSttRecognizer() {
   return sherpa_onnx.createOfflineRecognizer({
@@ -58,6 +101,10 @@ class Listener {
     this.browser = browser;
     this.recording = null;
     this.processing = false;
+    // Two-phase: 'wake' = waiting for trigger word, 'command' = waiting for command
+    this.phase = 'wake';
+    this.commandTimeout = null;
+    this.dataReceived = false;
   }
 
   async start() {
@@ -68,9 +115,10 @@ class Listener {
 
     console.log('Models loaded.');
     console.log(`Trigger word: "${this.triggerWord}"`);
-    console.log('Say the trigger word followed by your command (e.g. "' + this.triggerWord + ' open youtube")');
+    console.log('Say the trigger word, then speak your command after the sound.');
     console.log('Listening...\n');
 
+    this.phase = 'wake';
     this._startMic();
   }
 
@@ -83,9 +131,15 @@ class Listener {
       endian: 'little',
       bitDepth: 16,
       recorder: 'rec',
+      silence: 0,
     });
 
     this.recording.stream().on('data', (buffer) => {
+      if (!this.dataReceived) {
+        this.dataReceived = true;
+        debug('Mic data flowing. Buffer size:', buffer.length, 'bytes');
+      }
+
       if (this.processing) return;
 
       const samples = pcmBufferToFloat32(buffer);
@@ -100,6 +154,8 @@ class Listener {
         const segment = this.vad.front();
         this.vad.pop();
 
+        debug('Speech segment:', (segment.samples.length / SAMPLE_RATE).toFixed(1) + 's', 'phase:', this.phase);
+
         this.processing = true;
         this._handleSpeech(segment.samples);
       }
@@ -108,65 +164,101 @@ class Listener {
     this.recording.stream().on('error', (err) => {
       console.error('Microphone error:', err.message);
     });
+
+    // Check if mic is producing data
+    setTimeout(() => {
+      if (!this.dataReceived) {
+        console.error('\nNo audio data received!');
+        console.error('Check: 1) sox installed  2) mic permissions  3) mic connected');
+      }
+    }, 3000);
+  }
+
+  _transcribe(samples) {
+    const stream = this.recognizer.createStream();
+    stream.acceptWaveform(SAMPLE_RATE, samples);
+    this.recognizer.decode(stream);
+    const result = this.recognizer.getResult(stream);
+    stream.free();
+    return (result.text || '').trim().toLowerCase().replace(/[.,!?]+$/g, '');
   }
 
   async _handleSpeech(samples) {
     try {
-      // Transcribe
-      const stream = this.recognizer.createStream();
-      stream.acceptWaveform(SAMPLE_RATE, samples);
-      this.recognizer.decode(stream);
-      const result = this.recognizer.getResult(stream);
-      stream.free();
-
-      const text = (result.text || '').trim().toLowerCase()
-        .replace(/[.,!?]+$/g, '');
+      const text = this._transcribe(samples);
+      debug('Transcribed:', JSON.stringify(text), 'phase:', this.phase);
 
       if (!text) {
         this.processing = false;
         return;
       }
 
-      // Check if text starts with trigger word
-      if (!text.startsWith(this.triggerWord)) {
-        // Not a command, ignore
-        this.processing = false;
-        return;
-      }
+      if (this.phase === 'wake') {
+        // Fuzzy-match trigger word anywhere in the text
+        const afterTrigger = findTriggerWord(text, this.triggerWord);
 
-      // Extract the command part after the trigger word
-      const command = text.slice(this.triggerWord.length).trim();
+        if (afterTrigger !== null) {
+          if (afterTrigger) {
+            // Command was included with trigger word (e.g. "test open youtube")
+            console.log('Trigger word detected!');
+            playActivationSound();
+            debug('Command in same utterance:', afterTrigger);
+            await this._executeCommand(afterTrigger);
+            this.phase = 'wake';
+            this.vad.reset();
+            this.processing = false;
+            return;
+          }
 
-      if (!command) {
-        // Just the trigger word with no command
-        console.log('Trigger word detected but no command heard.');
-        playActivationSound();
-        this.processing = false;
-        return;
-      }
+          // Just the trigger word, wait for command
+          console.log('Trigger word detected! Say your command...');
+          playActivationSound();
+          this.phase = 'command';
+          this.vad.reset();
 
-      console.log(`Heard: "${command}"`);
-      playActivationSound();
-
-      const parsed = parse(command);
-      if (parsed) {
-        try {
-          await parsed.command.execute(parsed.params, this.browser);
-          playDeactivationSound();
-        } catch (err) {
-          console.log(`Error executing command: ${err.message}`);
-          playErrorSound();
+          // Timeout after 6 seconds
+          this.commandTimeout = setTimeout(() => {
+            if (this.phase === 'command') {
+              console.log('No command heard. Say the trigger word again.');
+              playErrorSound();
+              this.phase = 'wake';
+              this.vad.reset();
+            }
+          }, 6000);
+        } else {
+          debug('Ignored (no trigger word):', text);
         }
-      } else {
-        console.log(`Unknown command: "${command}"`);
-        playErrorSound();
+      } else if (this.phase === 'command') {
+        clearTimeout(this.commandTimeout);
+        await this._executeCommand(text);
+        this.phase = 'wake';
+        this.vad.reset();
       }
     } catch (err) {
       console.log(`Error: ${err.message}`);
       playErrorSound();
+      this.phase = 'wake';
     }
 
     this.processing = false;
+  }
+
+  async _executeCommand(text) {
+    console.log(`Heard: "${text}"`);
+
+    const parsed = parse(text);
+    if (parsed) {
+      try {
+        await parsed.command.execute(parsed.params, this.browser);
+        playDeactivationSound();
+      } catch (err) {
+        console.log(`Error executing command: ${err.message}`);
+        playErrorSound();
+      }
+    } else {
+      console.log(`Unknown command: "${text}"`);
+      playErrorSound();
+    }
   }
 
   stop() {
@@ -175,6 +267,7 @@ class Listener {
     }
     if (this.recognizer) this.recognizer.free();
     if (this.vad) this.vad.free();
+    clearTimeout(this.commandTimeout);
   }
 }
 
