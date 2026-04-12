@@ -15,7 +15,6 @@
   "description": "",
   "dependencies": {
     "dotenv": "^17.4.0",
-    "node-record-lpcm16": "^1.0.1",
     "playwright": "^1.59.1",
     "sherpa-onnx": "^1.12.35"
   }

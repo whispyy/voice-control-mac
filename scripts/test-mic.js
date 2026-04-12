@@ -1,5 +1,5 @@
 // Quick test to diagnose mic + VAD + STT pipeline
-const record = require('node-record-lpcm16');
+const { spawn } = require('child_process');
 const path = require('path');
 const sherpa_onnx = require('sherpa-onnx');
 const stt = require('../src/stt');
@@ -44,24 +44,18 @@ const vad = sherpa_onnx.createVad({
 });
 console.log('   VAD OK\n');
 
-console.log('3. Starting mic...');
+console.log('3. Starting mic (sox/rec)...');
 let dataChunks = 0;
 let totalSamples = 0;
 
-const recording = record.record({
-  sampleRate: SAMPLE_RATE,
-  channels: 1,
-  audioType: 'raw',
-  encoding: 'signed-integer',
-  endian: 'little',
-  bitDepth: 16,
-  recorder: 'rec',
-  silence: 0,
-});
+const rec = spawn('rec', [
+  '-q', '-r', String(SAMPLE_RATE), '-b', '16', '-c', '1',
+  '-e', 'signed-integer', '-t', 'raw', '-',
+]);
 
 console.log('   Mic started. Speak now! (will stop after 15 seconds)\n');
 
-recording.stream().on('data', (buffer) => {
+rec.stdout.on('data', (buffer) => {
   dataChunks++;
   const samples = pcmBufferToFloat32(buffer);
   totalSamples += samples.length;
@@ -86,12 +80,14 @@ recording.stream().on('data', (buffer) => {
   }
 });
 
-recording.stream().on('error', (err) => {
-  console.error('   Mic error:', err.message);
+rec.on('error', (err) => {
+  console.error('   Failed to start rec:', err.message);
+  console.error('   Install sox: brew install sox');
+  process.exit(1);
 });
 
 setTimeout(() => {
-  recording.stop();
+  rec.kill();
   console.log(`\n=== Summary ===`);
   console.log(`Data chunks received: ${dataChunks}`);
   console.log(`Total samples: ${totalSamples} (${(totalSamples / SAMPLE_RATE).toFixed(1)}s of audio)`);

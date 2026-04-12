@@ -1,4 +1,4 @@
-const record = require('node-record-lpcm16');
+const { spawn } = require('child_process');
 const path = require('path');
 const sherpa_onnx = require('sherpa-onnx');
 const stt = require('./stt');
@@ -104,18 +104,18 @@ class Listener {
   }
 
   _startMic() {
-    this.recording = record.record({
-      sampleRate: SAMPLE_RATE,
-      channels: 1,
-      audioType: 'raw',
-      encoding: 'signed-integer',
-      endian: 'little',
-      bitDepth: 16,
-      recorder: 'rec',
-      silence: 0,
-    });
+    // Spawn rec (part of sox) directly: 16kHz, 16-bit, mono, raw PCM output
+    this.recProcess = spawn('rec', [
+      '-q',                  // quiet (no progress)
+      '-r', String(SAMPLE_RATE),
+      '-b', '16',
+      '-c', '1',
+      '-e', 'signed-integer',
+      '-t', 'raw',
+      '-',                   // output to stdout
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
 
-    this.recording.stream().on('data', (buffer) => {
+    this.recProcess.stdout.on('data', (buffer) => {
       if (!this.dataReceived) {
         this.dataReceived = true;
         debug('Mic data flowing.');
@@ -140,14 +140,20 @@ class Listener {
       }
     });
 
-    this.recording.stream().on('error', (err) => {
-      console.error('Microphone error:', err.message);
+    this.recProcess.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) debug('rec:', msg);
+    });
+
+    this.recProcess.on('error', (err) => {
+      console.error('Failed to start rec:', err.message);
+      console.error('Install sox: brew install sox');
     });
 
     setTimeout(() => {
       if (!this.dataReceived) {
         console.error('\nNo audio data received!');
-        console.error('Check: 1) sox installed  2) mic permissions  3) mic connected');
+        console.error('Check: 1) sox installed (brew install sox)  2) mic permissions  3) mic connected');
       }
     }, 3000);
   }
@@ -226,8 +232,8 @@ class Listener {
   }
 
   stop() {
-    if (this.recording) {
-      this.recording.stop();
+    if (this.recProcess) {
+      this.recProcess.kill();
     }
     if (this.vad) this.vad.free();
     clearTimeout(this.commandTimeout);
